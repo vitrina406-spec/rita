@@ -4,6 +4,7 @@
   /* ---------- Telegram WebApp ---------- */
   const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
   const tgUser = tg && tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user : null;
+  const cs = tg && tg.CloudStorage && tg.isVersionAtLeast && tg.isVersionAtLeast('6.9') ? tg.CloudStorage : null;
   const COLORS = { light: { bg: '#fff5f8', card: '#ffffff' }, dark: { bg: '#1d1418', card: '#2a1c23' } };
 
   // Палитра розовая, а светлый/тёмный вариант берём из темы Telegram
@@ -45,7 +46,7 @@
 
   const settings = { currency: '₴', pricePerKg: 0 };
   try { Object.assign(settings, JSON.parse(localStorage.getItem('cake-settings') || '{}')); } catch (e) { /* ignore */ }
-  const saveSettings = () => { try { localStorage.setItem('cake-settings', JSON.stringify(settings)); } catch (e) { /* ignore */ } };
+  const saveSettings = () => { try { localStorage.setItem('cake-settings', JSON.stringify(settings)); } catch (e) { /* ignore */ } scheduleCloud(); };
 
   const money = (n) => new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 }).format(Number(n) || 0) + ' ' + esc(settings.currency);
   const kg = (n) => new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 }).format(Number(n) || 0) + ' кг';
@@ -80,8 +81,8 @@
     t.onabort = () => reject(t.error);
   });
   const dbAll = (s) => tx(s, 'readonly', (st) => st.getAll());
-  const dbPut = (s, v) => tx(s, 'readwrite', (st) => st.put(v));
-  const dbDel = (s, id) => tx(s, 'readwrite', (st) => st.delete(id));
+  const dbPut = (s, v) => tx(s, 'readwrite', (st) => st.put(v)).then((r) => { scheduleCloud(); return r; });
+  const dbDel = (s, id) => tx(s, 'readwrite', (st) => st.delete(id)).then((r) => { scheduleCloud(); return r; });
 
   /* ---------- constants & state ---------- */
   const STATUS = {
@@ -125,16 +126,110 @@
     return file;
   }
 
-  function attachHTML(files, editable) {
+  const isPdf = (f) => f.type === 'application/pdf' || /\.pdf$/i.test(f.name || '');
+  const isText = (f) => (f.type || '').startsWith('text/') || /\.txt$/i.test(f.name || '');
+
+  function attachHTML(files, editable, ref) {
     if (!files.length) return '';
+    ref = ref || { kind: '', id: '' };
     return `<div class="attach">${files.map((f, i) => {
       const rm = editable ? `<button type="button" class="rm" data-act="rm-file" data-i="${i}" aria-label="Убрать">✕</button>` : '';
       if (isImg(f)) return `<div class="att"><img src="${urlOf(f.blob)}" alt="${esc(f.name)}" data-act="view-img">${rm}</div>`;
-      return editable ? `<div class="att file"><span>📄</span>${esc(f.name)}${rm}</div>`
-        : `<a class="att file" href="${urlOf(f.blob)}" download="${esc(f.name)}" target="_blank" rel="noopener"><span>📄</span>${esc(f.name)}</a>`;
+      const icon = isPdf(f) ? '📕' : '📄';
+      if (editable) return `<div class="att file"><span>${icon}</span>${esc(f.name)}${rm}</div>`;
+      return `<button type="button" class="att file" data-act="open-file" data-ref="${esc(ref.kind)}:${esc(ref.id)}" data-i="${i}"><span>${icon}</span>${esc(f.name)}<small>Открыть</small></button>`;
     }).join('')}</div>`;
   }
   const refreshAttach = () => { const el = $('#attach'); if (el) el.innerHTML = attachHTML(draftFiles, true); };
+
+  /* ---------- просмотр файлов внутри приложения ---------- */
+  function openViewer(title, levels, apply) {
+    const el = document.createElement('div');
+    el.className = 'viewer2';
+    el.innerHTML = `<div class="vbar"><b class="vtitle">${esc(title)}</b>${levels > 1 ? '<button data-act="vz" data-d="-1" aria-label="Уменьшить">−</button><button data-act="vz" data-d="1" aria-label="Увеличить">＋</button>' : ''}<button data-act="close" aria-label="Закрыть">✕</button></div><div class="vbody"></div>`;
+    $('#sheet-root').appendChild(el);
+    el._zi = 0; el._levels = levels; el._apply = apply || (() => {});
+    sheetStack.push(el); syncBack();
+    return el;
+  }
+
+  function openImage(src, name) {
+    const ZOOM = [1, 1.6, 2.5, 4];
+    const v = openViewer(name || 'Фото', ZOOM.length, (el) => { const im = $('img', el); if (im) im.style.width = (ZOOM[el._zi] * 100) + '%'; });
+    $('.vbody', v).innerHTML = `<img src="${src}" alt="">`;
+  }
+
+  let pdfjsPromise;
+  function loadPdfJs() {
+    if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+    if (!pdfjsPromise) {
+      pdfjsPromise = new Promise((resolve, reject) => {
+        const sc = document.createElement('script');
+        sc.src = 'vendor/pdf.min.js';
+        sc.onload = () => { window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js'; resolve(window.pdfjsLib); };
+        sc.onerror = () => { pdfjsPromise = null; reject(new Error('pdfjs')); };
+        document.head.appendChild(sc);
+      });
+    }
+    return pdfjsPromise;
+  }
+
+  function renderPdf(v, zoom) {
+    const body = $('.vbody', v), pdf = v._pdf;
+    const token = (v._tok = (v._tok || 0) + 1);
+    body.innerHTML = '';
+    const width = Math.max(200, body.clientWidth - 16) * zoom;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const drawPage = async (holder) => {
+      if (token !== v._tok) return;
+      try {
+        const page = await pdf.getPage(Number(holder.dataset.n));
+        const base = page.getViewport({ scale: 1 });
+        const vp = page.getViewport({ scale: Math.min((width / base.width) * dpr, 2400 / base.width) });
+        const c = document.createElement('canvas');
+        c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+        c.style.width = Math.round(width) + 'px'; c.style.height = Math.round((width * base.height) / base.width) + 'px';
+        await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
+        if (token !== v._tok) return;
+        holder.style.minHeight = ''; holder.innerHTML = ''; holder.appendChild(c);
+      } catch (e) { holder.textContent = 'Не удалось показать страницу'; }
+    };
+    const io = new IntersectionObserver((entries) => entries.forEach((en) => { if (en.isIntersecting) { io.unobserve(en.target); drawPage(en.target); } }), { root: body, rootMargin: '900px 0px' });
+    for (let n = 1; n <= pdf.numPages; n++) {
+      const h = document.createElement('div');
+      h.className = 'pg'; h.dataset.n = n; h.style.width = Math.round(width) + 'px'; h.style.minHeight = Math.round(width * 1.3) + 'px';
+      body.appendChild(h); io.observe(h);
+    }
+  }
+
+  async function openPdf(file) {
+    const ZOOM = [1, 1.5, 2];
+    const v = openViewer(file.name, ZOOM.length, (el) => { if (el._pdf) renderPdf(el, ZOOM[el._zi]); });
+    const body = $('.vbody', v);
+    body.innerHTML = '<div class="vmsg">Открываю PDF…</div>';
+    try {
+      const lib = await loadPdfJs();
+      v._pdf = await lib.getDocument({ data: await file.blob.arrayBuffer() }).promise;
+      renderPdf(v, ZOOM[0]);
+    } catch (e) { console.error(e); body.innerHTML = '<div class="vmsg">Не удалось открыть этот PDF 😔</div>'; }
+  }
+
+  async function openText(file) {
+    const v = openViewer(file.name, 1);
+    $('.vbody', v).innerHTML = `<pre class="vtext">${esc(await file.blob.text())}</pre>`;
+  }
+
+  async function openFile(f) {
+    if (isImg(f)) return openImage(urlOf(f.blob), f.name);
+    if (isPdf(f)) return openPdf(f);
+    if (isText(f)) return openText(f);
+    try {
+      const file = new File([f.blob], f.name, { type: f.type });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file] }); return; }
+    } catch (e) { if (e && e.name === 'AbortError') return; }
+    toast('Такой формат нельзя открыть внутри приложения. Загрузите рецепт как PDF или фото 🌸');
+    return undefined;
+  }
 
   /* ---------- sheets ---------- */
   const sheetStack = [];
@@ -252,7 +347,7 @@
       <div class="fsec">🎂 Торт</div>
       <div class="grid2">
         <label>Вес, кг<input name="weight" inputmode="decimal" value="${o.weight || ''}" placeholder="2,5"></label>
-        <label>Порций<input name="servings" inputmode="numeric" value="${o.servings || ''}" placeholder="16"></label>
+        <label>Порций<input name="servings" inputmode="numeric" value="${esc(o.servings)}" placeholder="16"></label>
       </div>
       <label>Бисквит / вкус<input name="flavor" value="${esc(o.flavor)}" placeholder="Ванильный, шоколадный…"></label>
       <label>Начинка<input name="filling" value="${esc(o.filling)}" placeholder="Клубника, крем-чиз…"></label>
@@ -264,7 +359,7 @@
       <div class="fsec">💰 Оплата</div>
       <div class="grid2">
         <label>Стоимость<input name="price" inputmode="decimal" value="${o.price || ''}" placeholder="0"></label>
-        <label>Уже оплачено<input name="paid" inputmode="decimal" value="${o.paid || ''}" placeholder="предоплата"></label>
+        <label>Оплачено<input name="paid" inputmode="decimal" value="${o.paid || ''}" placeholder="предоплата"></label>
       </div>
       ${settings.pricePerKg > 0 ? `<button type="button" class="linkbtn" data-act="calc-price">✨ Посчитать по весу (${money(settings.pricePerKg)} за кг)</button>` : ''}
 
@@ -295,6 +390,8 @@
     return '';
   }
 
+  const lostHint = (x) => ((x.lostFiles || []).length ? `<div class="hint" style="margin-top:10px">📎 Файлы не сохранились в облаке: ${esc(x.lostFiles.join(', '))}. Загрузите их заново.</div>` : '');
+
   function openOrderDetail(id) {
     const o = orders.find((x) => x.id === id);
     if (!o) return;
@@ -318,7 +415,7 @@
         ${row('⚠️ Аллергии', esc(o.allergies))}
         ${row('Заметки', esc(o.notes))}
       </div></div>
-      ${(o.files || []).length ? `<div class="label">Фото</div>${attachHTML(o.files, false)}` : ''}
+      ${(o.files || []).length ? `<div class="label">Фото</div>${attachHTML(o.files, false, { kind: 'order', id: o.id })}` : lostHint(o)}
 
       <div class="panel">
         <div class="row"><b style="font-size:20px">${money(o.price)}</b>${debt > 0 ? `<span class="debt">осталось ${money(debt)}</span>` : (o.price > 0 ? '<span class="paid">оплачено ✓</span>' : '')}</div>
@@ -339,7 +436,7 @@
     openSheet(`<form data-form="pay" data-id="${id}">
       <h2>Новая оплата 💸</h2>
       <div class="hint">${esc(o.client)} · осталось ${money(debt)}</div>
-      <label>Сумма<input name="amount" required inputmode="decimal" placeholder="0" value="${debt || ''}" autofocus></label>
+      <label>Сумма<input name="amount" required inputmode="decimal" placeholder="0" value="${debt || ''}"></label>
       <div class="quick">
         ${debt > 0 ? `<button type="button" class="chip-btn" data-act="pay-fill" data-v="${debt}">Весь остаток</button>` : ''}
         ${o.price > 0 && !o.paid ? `<button type="button" class="chip-btn" data-act="pay-fill" data-v="${Math.round(o.price / 2)}">Предоплата 50%</button>` : ''}
@@ -478,7 +575,7 @@
       ${(r.ings || []).length ? `<div id="ing-block">${ingBlockHTML(r, 1)}</div>` : ''}
       ${r.steps ? `<div class="label">Приготовление</div><div class="text">${esc(r.steps)}</div>` : ''}
       ${r.notes ? `<div class="label">Заметки</div><div class="text">${esc(r.notes)}</div>` : ''}
-      ${(r.files || []).length ? `<div class="label">Файлы</div>${attachHTML(r.files, false)}` : ''}
+      ${(r.files || []).length ? `<div class="label">Файлы</div>${attachHTML(r.files, false, { kind: 'recipe', id: r.id })}` : lostHint(r)}
       <div class="actions"><button class="btn ghost" data-act="edit-recipe" data-id="${r.id}">✏️ Изменить</button><button class="btn danger" data-act="del-recipe" data-id="${r.id}">Удалить</button></div>
     `);
   }
@@ -505,7 +602,7 @@
     const today = active.filter((o) => orderDate(o) === t);
     const soon = active.filter((o) => orderDate(o) > t).slice(0, 4);
     const debt = orders.filter((o) => o.status !== 'cancel').reduce((a, o) => a + debtOf(o), 0);
-    const ms = monthStats(state.month === t.slice(0, 7) ? state.month : t.slice(0, 7));
+    const ms = monthStats(t.slice(0, 7));
     return `
       ${overdue.length ? `<div class="alert" data-act="filter-go">⚠️ Просроченных заказов: ${overdue.length}. Проверьте и отметьте «Выдан».</div>` : ''}
       <div class="actions3">
@@ -616,7 +713,85 @@
     closeSheet(); render(); haptic(); toast('Расход добавлен');
   }
 
+  /* ---------- облако Telegram: автокопия текстовых данных ---------- */
+  const csCall = (m, ...a) => new Promise((res, rej) => cs[m](...a, (err, v) => (err ? rej(new Error(String(err))) : res(v))));
+  const csGet = (keys) => csCall('getItems', keys);
+  const csSet = (k, v) => csCall('setItem', k, v);
+  const csRemove = (keys) => csCall('removeItems', keys);
+  let cloudTimer = null, cloudReady = false, cloudInfo = { at: null, err: null };
+  const parseMeta = (v) => { try { const m = JSON.parse(v); return m && m.n ? m : null; } catch (e) { return null; } };
+  const stripFiles = (rows) => rows.map(({ files, ...rest }) => ({ ...rest, lostFiles: (files || []).map((f) => f.name).concat(rest.lostFiles || []) }));
+
+  function chunkString(str, size) {
+    const out = [];
+    let i = 0;
+    while (i < str.length) {
+      let j = Math.min(i + size, str.length);
+      const c = str.charCodeAt(j - 1);
+      if (c >= 0xD800 && c <= 0xDBFF && j < str.length) j += 1; // не режем эмодзи пополам
+      out.push(str.slice(i, j)); i = j;
+    }
+    return out;
+  }
+
+  function scheduleCloud() {
+    if (!cs || !cloudReady) return;
+    clearTimeout(cloudTimer);
+    cloudTimer = setTimeout(() => { cloudTimer = null; cloudSave(); }, 1500);
+  }
+  document.addEventListener('visibilitychange', () => { if (document.hidden && cloudTimer) { clearTimeout(cloudTimer); cloudTimer = null; cloudSave(); } });
+
+  // Две «ячейки» (a/b) по очереди: если запись прервётся, прошлая копия остаётся целой
+  async function cloudSave() {
+    if (!cs || !cloudReady) return false;
+    try {
+      const snap = JSON.stringify({ v: 1, settings, orders: stripFiles(orders), recipes: stripFiles(recipes), expenses });
+      const chunks = chunkString(snap, 1300);
+      if (chunks.length > 450) throw new Error('Слишком много данных для облака Telegram');
+      const prev = parseMeta((await csGet(['bk_meta'])).bk_meta);
+      const slot = prev && prev.s === 'a' ? 'b' : 'a';
+      for (let i = 0; i < chunks.length; i += 8) await Promise.all(chunks.slice(i, i + 8).map((c, k) => csSet(slot + (i + k), c)));
+      await csSet('bk_meta', JSON.stringify({ s: slot, n: chunks.length, at: new Date().toISOString() }));
+      if (prev) { const rm = []; for (let i = 0; i < prev.n; i++) rm.push(prev.s + i); for (let i = 0; i < rm.length; i += 40) await csRemove(rm.slice(i, i + 40)); }
+      cloudInfo = { at: new Date(), err: null };
+      return true;
+    } catch (e) { cloudInfo = { at: cloudInfo.at, err: String((e && e.message) || e) }; return false; }
+  }
+
+  // возвращает true, если проверка облака прошла (даже если копии нет)
+  async function cloudRestore(auto) {
+    if (!cs) { if (!auto) toast('Облако Telegram недоступно в этой версии'); return false; }
+    if (auto && (orders.length || recipes.length || expenses.length)) return true;
+    try {
+      const meta = parseMeta((await csGet(['bk_meta'])).bk_meta);
+      if (!meta) { if (!auto) toast('В облаке пока ничего нет'); return true; }
+      const when = new Date(meta.at).toLocaleString('ru-RU');
+      if (!(await ask(`Нашли копию в облаке Telegram от ${when}. Восстановить заказы, рецепты и расходы? (Фото и файлы в облако не попадают.)`))) return true;
+      let json = '';
+      for (let i = 0; i < meta.n; i += 40) {
+        const keys = []; for (let j = i; j < Math.min(meta.n, i + 40); j++) keys.push(meta.s + j);
+        const part = await csGet(keys); keys.forEach((k) => { json += part[k] || ''; });
+      }
+      const snap = JSON.parse(json);
+      let added = 0;
+      for (const [store, list, have] of [['orders', snap.orders, orders], ['recipes', snap.recipes, recipes], ['expenses', snap.expenses, expenses]]) {
+        const ids = new Set(have.map((x) => x.id));
+        for (const rec of list || []) if (!ids.has(rec.id)) { await dbPut(store, { ...rec, files: [] }); added += 1; }
+      }
+      if (snap.settings) { Object.assign(settings, snap.settings); saveSettings(); }
+      await loadAll(); render(); haptic(); toast(`Восстановлено записей: ${added} ☁️`);
+      return true;
+    } catch (e) { console.error(e); haptic('error'); toast('Не удалось восстановить из облака'); return false; }
+  }
+
   /* ---------- settings & backup ---------- */
+  function cloudStatus() {
+    if (!cs) return 'Недоступно в этой версии Telegram. Обновите приложение Telegram.';
+    if (cloudInfo.err) return `⚠️ Ошибка: ${esc(cloudInfo.err)}`;
+    if (cloudInfo.at) return `✅ Сохранено ${cloudInfo.at.toLocaleString('ru-RU')}`;
+    return 'Включено. Копия обновляется сама после каждого изменения.';
+  }
+
   function openSettings() {
     const who = tgUser ? `${esc(tgUser.first_name || '')} ${esc(tgUser.last_name || '')}${tgUser.username ? ' (@' + esc(tgUser.username) + ')' : ''}` : 'Открыто вне Telegram';
     openSheet(`<form data-form="settings">
@@ -627,11 +802,20 @@
         <label>Цена за 1 кг<input name="pricePerKg" inputmode="decimal" value="${settings.pricePerKg || ''}" placeholder="для расчёта"></label>
       </div>
       <div class="actions"><button class="btn" type="submit">Сохранить</button></div>
-      <h3>Резервная копия</h3>
-      <div class="hint" style="margin-bottom:10px">Данные хранятся на этом устройстве, в памяти Telegram. Делайте копию время от времени, особенно перед сменой телефона.</div>
+
+      <h3>☁️ Облако Telegram</h3>
+      <div class="hint" id="cloud-status">${cloudStatus()}</div>
+      <div class="hint" style="margin:6px 0 10px">Заказы, рецепты (текст), расходы и настройки копируются в облако Telegram автоматически. На новом телефоне приложение предложит их вернуть. Фото и файлы в облако не попадают.</div>
+      <div class="actions" style="margin-top:0">
+        <button type="button" class="btn ghost" data-act="cloud-save">☁️ Сохранить сейчас</button>
+        <button type="button" class="btn ghost" data-act="cloud-restore">Восстановить</button>
+      </div>
+
+      <h3>Файл с полной копией (с фото)</h3>
+      <div class="hint" style="margin-bottom:10px">В некоторых версиях Telegram сохранение файла может не сработать. Тогда ориентируйтесь на облачную копию выше.</div>
       <div class="actions" style="margin-top:0">
         <button type="button" class="btn ghost" data-act="export">⬇️ Скачать копию</button>
-        <button type="button" class="btn ghost" data-act="import">⬆️ Восстановить</button>
+        <button type="button" class="btn ghost" data-act="import">⬆️ Из файла</button>
       </div>
       <input type="file" id="import-file" accept="application/json,.json" hidden>
     </form>`);
@@ -651,13 +835,20 @@
         expenses,
       };
       const file = new File([JSON.stringify(dump)], `cake-backup-${todayStr()}.json`, { type: 'application/json' });
-      if (navigator.canShare && navigator.canShare({ files: [file] })) await navigator.share({ files: [file] });
-      else {
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 12000));
+        await Promise.race([navigator.share({ files: [file] }), timeout]);
+        toast('Готово ✅');
+      } else {
         const a = document.createElement('a');
         a.href = URL.createObjectURL(file); a.download = file.name;
         document.body.appendChild(a); a.click(); a.remove();
+        toast('Если файл не появился, этот телефон не умеет сохранять файлы из Telegram. Используйте ☁️ облачную копию.');
       }
-    } catch (e) { if (e && e.name !== 'AbortError') toast('Не удалось сохранить копию'); }
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;
+      toast('Файл сохранить не удалось. Используйте ☁️ облачную копию.');
+    }
   }
 
   async function importData(file) {
@@ -728,13 +919,29 @@
         break;
 
       case 'rm-file': draftFiles.splice(Number(el.dataset.i), 1); refreshAttach(); break;
-      case 'view-img': {
-        const v = document.createElement('div');
-        v.className = 'viewer'; v.innerHTML = `<img src="${el.src}" alt="">`;
-        v.addEventListener('click', () => v.remove());
-        document.body.appendChild(v);
+      case 'view-img': openImage(el.src, el.alt); break;
+      case 'open-file': {
+        const [kind, rid] = el.dataset.ref.split(':');
+        const rec = (kind === 'order' ? orders : recipes).find((x) => x.id === rid);
+        const f = rec && (rec.files || [])[Number(el.dataset.i)];
+        if (f) openFile(f);
         break;
       }
+      case 'vz': {
+        const v = el.closest('.viewer2');
+        if (v) { v._zi = Math.max(0, Math.min(v._levels - 1, v._zi + Number(el.dataset.d))); v._apply(v); }
+        break;
+      }
+      case 'cloud-save': {
+        if (!cs) { toast('Облако недоступно в этой версии Telegram'); break; }
+        if (!cloudReady) { toast('Облако ещё проверяется, подождите пару секунд'); break; }
+        toast('Сохраняю…');
+        const ok = await cloudSave();
+        const st = $('#cloud-status'); if (st) st.innerHTML = cloudStatus();
+        toast(ok ? 'Сохранено в облако ☁️' : 'Не удалось сохранить в облако');
+        break;
+      }
+      case 'cloud-restore': cloudRestore(false); break;
       case 'export': exportData(); break;
       case 'import': $('#import-file').click(); break;
       default: break;
@@ -793,6 +1000,7 @@
         draftFiles.push({ name: small.name, type: small.type, blob: small });
       }
       refreshAttach();
+      if (files.some((f) => !isImg(f) && !isPdf(f) && !isText(f))) toast('Word и Excel нельзя просмотреть внутри приложения. Лучше загрузить PDF или фото 🌸');
     }
     if (t.id === 'import-file' && t.files[0]) { importData(t.files[0]); t.value = ''; }
   });
@@ -813,6 +1021,7 @@
       await loadAll();
       if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
       render();
+      setTimeout(async () => { cloudReady = await cloudRestore(true); }, 300);
     } catch (err) {
       console.error(err);
       $('#view').innerHTML = '<div class="empty"><div class="big">⚠️</div>Не удалось открыть хранилище.<br>Попробуйте перезапустить Telegram.</div>';
