@@ -5,7 +5,7 @@
   const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
   const tgUser = tg && tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user : null;
   const cs = tg && tg.CloudStorage && tg.isVersionAtLeast && tg.isVersionAtLeast('6.9') ? tg.CloudStorage : null;
-  const COLORS = { light: { bg: '#fff5f8', card: '#ffffff' }, dark: { bg: '#1d1418', card: '#2a1c23' } };
+  const COLORS = { light: { bg: '#fff3d8', card: '#fff3d8' }, dark: { bg: '#2b0b16', card: '#2b0b16' } };
 
   // Палитра розовая, а светлый/тёмный вариант берём из темы Telegram
   function applyTheme() {
@@ -49,6 +49,7 @@
   const saveSettings = () => { try { localStorage.setItem('cake-settings', JSON.stringify(settings)); } catch (e) { /* ignore */ } scheduleCloud(); };
 
   const money = (n) => new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 }).format(Number(n) || 0) + ' ' + esc(settings.currency);
+  const plural = (n, a, b, c) => { const m = Math.abs(n) % 100, k = m % 10; return m > 10 && m < 20 ? c : k > 1 && k < 5 ? b : k === 1 ? a : c; };
   const kg = (n) => new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 }).format(Number(n) || 0) + ' кг';
 
   function toast(msg) {
@@ -272,7 +273,7 @@
     const debt = debtOf(o);
     const d = parseDate(orderDate(o));
     const meta = [o.time ? `🕐 ${esc(o.time)}` : '', o.weight ? kg(o.weight) : '', o.delivery === 'delivery' ? '🚗 доставка' : '', o.filling ? esc(o.filling) : ''].filter(Boolean).join(' · ');
-    return `<div class="card order" data-act="open-order" data-id="${o.id}">
+    return `<div class="card order" data-st="${esc(o.status)}" data-act="open-order" data-id="${o.id}">
       <div class="dbox"><b>${d.getDate()}</b><span>${MON_SHORT[d.getMonth()]}</span></div>
       <div class="obody">
         <div class="row"><div class="title">${esc(o.client) || 'Без имени'}</div><span class="chip ${stCls}">${stName}</span></div>
@@ -605,12 +606,18 @@
     const ms = monthStats(t.slice(0, 7));
     return `
       ${overdue.length ? `<div class="alert" data-act="filter-go">⚠️ Просроченных заказов: ${overdue.length}. Проверьте и отметьте «Выдан».</div>` : ''}
-      <div class="actions3">
-        <button class="btn" data-act="add-order"><span>🎂</span>Заказ</button>
-        <button class="btn ghost" data-act="add-recipe"><span>📖</span>Рецепт</button>
-        <button class="btn ghost" data-act="add-expense"><span>🧾</span>Расход</button>
-      </div>
-      <h3>Сегодня · ${today.length}</h3>
+      <section class="today-hero">
+        <i class="fl a"></i><i class="fl b"></i>
+        <span class="sticker">сегодня</span>
+        <div class="th-num"><b>${today.length}</b><span>${plural(today.length, 'заказ', 'заказа', 'заказов')}<br>на сегодня</span></div>
+        <div class="th-sub">${overdue.length ? `Просрочено: ${overdue.length}` : today.length ? 'Список — ниже ↓' : (soon.length ? `Дальше в планах: ${soon.length}` : 'Можно выдохнуть')}</div>
+        <div class="actions3">
+          <button class="btn" data-act="add-order"><span>🎂</span>Заказ</button>
+          <button class="btn" data-act="add-recipe"><span>📖</span>Рецепт</button>
+          <button class="btn" data-act="add-expense"><span>🧾</span>Расход</button>
+        </div>
+      </section>
+      <h3>Сегодня</h3>
       ${today.length ? today.map(orderCard).join('') : '<div class="card"><div class="hint">На сегодня заказов нет. Можно выдохнуть 🌸</div></div>'}
       ${soon.length ? `<h3>Скоро</h3>${soon.map(orderCard).join('')}` : ''}
       <h3>Коротко о деньгах</h3>
@@ -1010,7 +1017,7 @@
 
   function setHeader() {
     const name = tgUser && (tgUser.first_name || tgUser.username);
-    $('#hello').textContent = name ? `Привет, ${name} 🌸` : 'Привет 🌸';
+    $('#hello').textContent = name ? `Привет, ${name}` : 'Привет';
     $('#today').textContent = new Date().toLocaleDateString('ru-RU', { weekday: 'long', day: 'numeric', month: 'long' });
   }
 
