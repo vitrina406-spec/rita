@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ru" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#fff5f8">
+  <title>Кондитерская</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <header class="top">
+      <div>
+        <div id="hello" class="hello">Привет 🌸</div>
+        <div id="today" class="hint"></div>
+      </div>
+      <button class="icon-btn" data-act="settings" aria-label="Настройки">⚙️</button>
+    </header>
+
+    <main id="view"></main>
+
+    <nav class="tabs">
+      <button data-act="tab" data-tab="home"><span>🏠</span>Главная</button>
+      <button data-act="tab" data-tab="orders"><span>🎂</span>Заказы</button>
+      <button data-act="tab" data-tab="recipes"><span>📖</span>Рецепты</button>
+      <button data-act="tab" data-tab="income"><span>💰</span>Доходы</button>
+    </nav>
+  </div>
+
+  <div id="sheet-root"></div>
+  <div id="toast"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

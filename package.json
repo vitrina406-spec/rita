@@ -1,0 +1,9 @@
+{
+  "name": "cake-miniapp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram Mini App: заказы, рецепты и учёт доходов для кондитера",
+  "scripts": {
+    "dev": "npx serve ."
+  }
+}
